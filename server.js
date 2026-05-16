@@ -1,81 +1,120 @@
-const { WebSocketServer } = require('ws');
+const express = require('express');
+const http = require('http');
+const path = require('path');
+const WebSocket = require('ws');
 
-const PORT = process.env.PORT || 8080;
-const wss = new WebSocketServer({ port: PORT });
+const app = express();
+const publicDir = path.resolve(__dirname);
+app.use(express.static(publicDir));
 
-// rooms: Map<roomId, Set<ws>>
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
 const rooms = new Map();
+const clients = new Map();
 
-wss.on('connection', (ws) => {
-  ws._pid  = null;
-  ws._name = 'Unknown';
-  ws._skin = '#ffffff';
-  ws._room = null;
+function safeSend(ws, payload) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(payload));
+  }
+}
 
-  ws.on('message', (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
-
-    // ── JOIN ──────────────────────────────────────────────────────────────
-    if (msg.type === 'join') {
-      ws._pid  = msg.id   || ws._pid;
-      ws._name = msg.name || 'Unknown';
-      ws._skin = msg.skin || '#ffffff';
-      ws._room = msg.room || 'default';
-
-      if (!rooms.has(ws._room)) rooms.set(ws._room, new Set());
-      const room = rooms.get(ws._room);
-
-      // Send the newcomer a list of everyone already in the room
-      const existing = [...room].filter(c => c !== ws && c.readyState === 1);
-      ws.send(JSON.stringify({
-        type: 'player_list',
-        players: existing.map(c => ({ id: c._pid, name: c._name, skin: c._skin }))
-      }));
-
-      // Tell everyone else this player joined
-      broadcast(room, ws, {
-        type: 'player_join',
-        id:   ws._pid,
-        name: ws._name,
-        skin: ws._skin
-      });
-
-      room.add(ws);
-      console.log(`[+] ${ws._name} (${ws._pid}) joined room "${ws._room}"  (${room.size} players)`);
-    }
-
-    if (!ws._room) return;
-    const room = rooms.get(ws._room);
-    if (!room) return;
-
-    // ── RELAY ─────────────────────────────────────────────────────────────
-    if (msg.type === 'player_update') broadcast(room, ws, msg);
-    if (msg.type === 'block_break')   broadcast(room, ws, msg);
-    if (msg.type === 'block_place')   broadcast(room, ws, msg);
-    if (msg.type === 'chat')          broadcast(room, ws, msg);
-  });
-
-  ws.on('close', () => {
-    if (!ws._room) return;
-    const room = rooms.get(ws._room);
-    if (!room) return;
-    room.delete(ws);
-    broadcast(room, ws, { type: 'player_leave', id: ws._pid });
-    console.log(`[-] ${ws._name} left room "${ws._room}"  (${room.size} players)`);
-    if (room.size === 0) rooms.delete(ws._room);
-  });
-
-  ws.on('error', () => {});
-});
-
-function broadcast(room, sender, msg) {
-  const data = JSON.stringify(msg);
+function broadcast(roomKey, payload, excludeWs = null) {
+  const room = rooms.get(roomKey);
+  if (!room) return;
+  const data = JSON.stringify(payload);
   for (const client of room) {
-    if (client !== sender && client.readyState === 1) {
+    if (client !== excludeWs && client.readyState === WebSocket.OPEN) {
       client.send(data);
     }
   }
 }
 
-console.log(`WebSocket server listening on port ${PORT}`);
+wss.on('connection', (ws) => {
+  ws.on('message', (message) => {
+    let msg;
+    try {
+      msg = JSON.parse(message.toString());
+    } catch (err) {
+      return;
+    }
+
+    if (!msg || typeof msg !== 'object' || typeof msg.type !== 'string') {
+      return;
+    }
+
+    if (msg.type === 'join') {
+      const { room, id, name, skin } = msg;
+      if (typeof room !== 'string' || typeof id !== 'string') {
+        return;
+      }
+
+      const roomKey = room;
+      const roomSet = rooms.get(roomKey) || new Set();
+      rooms.set(roomKey, roomSet);
+
+      const existingPlayers = [];
+      for (const client of roomSet) {
+        const data = clients.get(client);
+        if (data) {
+          existingPlayers.push({ id: data.id, name: data.name, skin: data.skin });
+        }
+      }
+
+      clients.set(ws, { room: roomKey, id, name, skin });
+      roomSet.add(ws);
+
+      safeSend(ws, { type: 'player_list', players: existingPlayers });
+      broadcast(roomKey, { type: 'player_join', id, name, skin }, ws);
+      return;
+    }
+
+    const client = clients.get(ws);
+    if (!client || !client.room) {
+      return;
+    }
+
+    const allowedForward = new Set([
+      'player_update',
+      'block_break',
+      'block_place',
+      'chat',
+      'admin_weather',
+      'admin_calm',
+      'admin_storm',
+      'admin_day',
+      'admin_night',
+      'admin_heal',
+      'admin_kill',
+      'admin_kick'
+    ]);
+
+    if (allowedForward.has(msg.type)) {
+      broadcast(client.room, msg, ws);
+    }
+  });
+
+  ws.on('close', () => {
+    const client = clients.get(ws);
+    if (!client || !client.room) return;
+
+    const roomKey = client.room;
+    const room = rooms.get(roomKey);
+    if (room) {
+      room.delete(ws);
+      if (room.size === 0) {
+        rooms.delete(roomKey);
+      }
+    }
+
+    broadcast(roomKey, { type: 'player_leave', id: client.id }, ws);
+    clients.delete(ws);
+  });
+
+  ws.on('error', () => {});
+});
+
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+});
